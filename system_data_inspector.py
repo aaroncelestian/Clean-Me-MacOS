@@ -65,6 +65,7 @@ _check_and_install_dependencies()
 # ---------------------------------------------------------------------------
 
 import csv
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -415,6 +416,152 @@ def get_dir_size(path: Path, max_depth: int = None, _current_depth: int = 0) -> 
     except (PermissionError, OSError):
         pass
     return total
+
+
+# ---------------------------------------------------------------------------
+# Repeat Offender Log
+# ---------------------------------------------------------------------------
+
+LOG_PATH = Path(
+    "~/Library/Application Support/CleanMeMacOS/offender_log.json"
+).expanduser()
+
+
+class OffenderLog:
+    """Persistent log that tracks apps appearing across multiple scans."""
+
+    VERSION = 1
+
+    def __init__(self):
+        self._data: dict = {"version": self.VERSION, "apps": {}}
+        self._load()
+
+    def _load(self):
+        if LOG_PATH.exists():
+            try:
+                with open(LOG_PATH, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and "apps" in loaded:
+                    self._data = loaded
+            except Exception:
+                pass
+
+    def _save(self):
+        try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, default=str)
+        except Exception:
+            pass
+
+    def record_scan(self, items: list):
+        """Called after each scan; groups items by app and logs cumulative stats."""
+        now = datetime.now().isoformat()
+        by_app: dict[str, dict] = {}
+        for item in items:
+            name = item["app_name"]
+            if name not in by_app:
+                by_app[name] = {"size_bytes": 0, "categories": set()}
+            by_app[name]["size_bytes"] += item["size_bytes"]
+            by_app[name]["categories"].add(item["category"])
+
+        apps = self._data["apps"]
+        for name, agg in by_app.items():
+            if name not in apps:
+                apps[name] = {
+                    "times_seen": 0,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "categories": [],
+                    "notes": "",
+                    "flagged": False,
+                    "scan_history": [],
+                }
+            entry = apps[name]
+            entry["times_seen"] += 1
+            entry["last_seen"] = now
+            entry["categories"] = sorted(
+                set(entry["categories"]) | agg["categories"]
+            )
+            entry["scan_history"].append({
+                "date": now,
+                "size_bytes": agg["size_bytes"],
+                "categories": sorted(agg["categories"]),
+            })
+            if len(entry["scan_history"]) > 50:
+                entry["scan_history"] = entry["scan_history"][-50:]
+
+        self._save()
+
+    def flag_app(self, app_name: str, note: str = ""):
+        """Manually mark an app as a person of interest."""
+        now = datetime.now().isoformat()
+        apps = self._data["apps"]
+        if app_name not in apps:
+            apps[app_name] = {
+                "times_seen": 0,
+                "first_seen": now,
+                "last_seen": now,
+                "categories": [],
+                "notes": note,
+                "flagged": True,
+                "scan_history": [],
+            }
+        else:
+            apps[app_name]["flagged"] = True
+            if note:
+                apps[app_name]["notes"] = note
+        self._save()
+
+    def clear_app(self, app_name: str):
+        if app_name in self._data["apps"]:
+            del self._data["apps"][app_name]
+            self._save()
+
+    def clear_all(self):
+        self._data["apps"] = {}
+        self._save()
+
+    def get_offenders(self) -> list:
+        """Return all tracked apps sorted by sightings desc, then peak size desc."""
+        result = []
+        for name, entry in self._data["apps"].items():
+            history = entry.get("scan_history", [])
+            sizes = [h["size_bytes"] for h in history]
+            peak = max(sizes) if sizes else 0
+            last_size = sizes[-1] if sizes else 0
+            prev_size = sizes[-2] if len(sizes) >= 2 else last_size
+            if last_size > prev_size * 1.05:
+                trend = "↑ Growing"
+            elif last_size < prev_size * 0.95:
+                trend = "↓ Shrinking"
+            else:
+                trend = "~ Stable"
+            result.append({
+                "app_name": name,
+                "times_seen": entry["times_seen"],
+                "first_seen": entry["first_seen"],
+                "last_seen": entry["last_seen"],
+                "categories": ", ".join(entry.get("categories", [])),
+                "peak_size_bytes": peak,
+                "last_size_bytes": last_size,
+                "trend": trend,
+                "flagged": entry.get("flagged", False),
+                "notes": entry.get("notes", ""),
+            })
+        result.sort(key=lambda x: (-x["times_seen"], -x["peak_size_bytes"]))
+        return result
+
+    def offender_count(self) -> int:
+        """Number of apps seen 2+ times or manually flagged."""
+        return sum(
+            1 for e in self._data["apps"].values()
+            if e["times_seen"] >= 2 or e.get("flagged")
+        )
+
+    @property
+    def log_path(self) -> Path:
+        return LOG_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1220,7 @@ class CleanupAdviceDialog(QDialog):
         cat = self._item["category"]
         folder = Path(self._item["path"]).name
         query = urllib.parse.quote(
-            f'mac "{app}" "{cat}" folder safe to delete site:reddit.com OR site:apple.com'
+            f'mac {app} {cat} folder safe to delete'
         )
         url = f"https://www.google.com/search?q={query}"
         try:
@@ -1502,6 +1649,35 @@ class SystemDataDialog(QDialog):
 
         layout.addStretch()
 
+        disclaimer = QLabel(
+            "<b>⏳  Cleaned something? Storage Settings may not update right away.</b><br><br>"
+            "macOS tracks disk usage through a metadata cache managed by a background daemon "
+            "(<i>storagekitd</i>) that refreshes on its own schedule — not instantly. "
+            "Freed space is reclaimed on disk immediately, but the number shown under "
+            "<i>Settings → General → Storage → System Data</i> can lag by minutes or hours.<br><br>"
+            "<b>Why the delay?</b><br>"
+            "• <b>APFS deferred reclamation</b> — freed blocks are not always returned to the "
+            "pool until a checkpoint occurs.<br>"
+            "• <b>Local Time Machine snapshots</b> — macOS temporarily retains deleted data "
+            "in snapshots before they expire or are purged.<br>"
+            "• <b>Storage accounting daemon</b> — <i>storagekitd</i> re-tallies usage "
+            "periodically in the background, not on every delete.<br>"
+            "• <b>Spotlight re-indexing</b> — deletions trigger a brief re-index which can "
+            "cause the storage count to appear stale.<br><br>"
+            "<b>To see updated numbers sooner:</b> restart your Mac, or open "
+            "<i>Disk Utility → select your disk → First Aid</i>.<br><br>"
+            "<i>If you are unsure whether something is safe to delete — don't. "
+            "Use 'Search the Web' to research first, then make a deliberate decision.</i>"
+        )
+        disclaimer.setTextFormat(Qt.RichText)
+        disclaimer.setWordWrap(True)
+        disclaimer.setStyleSheet(
+            "font-size: 10px; color: #AAAAAA; background-color: #1E1E1E; "
+            "border: 1px solid #3A3A3A; border-radius: 5px; padding: 10px; "
+            "margin-top: 4px;"
+        )
+        layout.addWidget(disclaimer)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
@@ -1611,6 +1787,234 @@ class SystemDataDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Repeat Offenders Dialog
+# ---------------------------------------------------------------------------
+
+_OFF_COLS = ["App", "Sightings", "Peak Size", "Last Size", "Trend", "Last Seen", "Categories"]
+_OFF_APP, _OFF_SEEN, _OFF_PEAK, _OFF_LAST, _OFF_TREND, _OFF_DATE, _OFF_CATS = range(7)
+
+
+class OffenderTableModel(QAbstractTableModel):
+    def __init__(self, items: list):
+        super().__init__()
+        self._items = items
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._items)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(_OFF_COLS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return _OFF_COLS[section]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        item = self._items[index.row()]
+        col = index.column()
+
+        if role == Qt.DisplayRole:
+            if col == _OFF_APP:
+                return ("★ " if item["flagged"] else "") + item["app_name"]
+            if col == _OFF_SEEN:
+                return str(item["times_seen"])
+            if col == _OFF_PEAK:
+                return format_size(item["peak_size_bytes"])
+            if col == _OFF_LAST:
+                return format_size(item["last_size_bytes"])
+            if col == _OFF_TREND:
+                return item["trend"]
+            if col == _OFF_DATE:
+                try:
+                    return datetime.fromisoformat(item["last_seen"]).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return item["last_seen"]
+            if col == _OFF_CATS:
+                return item["categories"]
+
+        if role == Qt.ForegroundRole:
+            n = item["times_seen"]
+            if item["flagged"] and n == 0:
+                return QBrush(QColor("#BB88FF"))
+            if n >= 5:
+                return QBrush(QColor("#E74C3C"))
+            if n >= 3:
+                return QBrush(QColor("#F39C12"))
+            if n >= 2:
+                return QBrush(QColor("#E8C63A"))
+            return QBrush(QColor("#CCCCCC"))
+
+        if role == Qt.UserRole:
+            if col == _OFF_SEEN:
+                return item["times_seen"]
+            if col == _OFF_PEAK:
+                return item["peak_size_bytes"]
+            if col == _OFF_LAST:
+                return item["last_size_bytes"]
+            if col == _OFF_DATE:
+                return item["last_seen"]
+            return self.data(index, Qt.DisplayRole)
+
+        return None
+
+
+class RepeatOffendersDialog(QDialog):
+    def __init__(self, offender_log: OffenderLog, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚨  Repeat Offenders Log")
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(540)
+        self.setModal(True)
+        self._log = offender_log
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 14)
+
+        title = QLabel("🚨  Repeat Offenders Log")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #E8E8E8;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Apps spotted across multiple scans — data hoarders, cache leakers, and general troublemakers. "
+            "Use this to decide which apps to investigate or uninstall."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size: 11px; color: #AAAAAA; margin-bottom: 4px;")
+        layout.addWidget(subtitle)
+
+        self._table = QTableView()
+        self._model = OffenderTableModel(self._log.get_offenders())
+        self._proxy = QSortFilterProxyModel()
+        self._proxy.setSourceModel(self._model)
+        self._proxy.setSortRole(Qt.UserRole)
+        self._table.setModel(self._proxy)
+        self._table.setSortingEnabled(True)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setAlternatingRowColors(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.verticalHeader().setVisible(False)
+        self._table.sortByColumn(_OFF_SEEN, Qt.DescendingOrder)
+        layout.addWidget(self._table)
+
+        legend = QLabel(
+            "<span style='color:#E8C63A'>●</span> 2 sightings &nbsp; "
+            "<span style='color:#F39C12'>●</span> 3–4 sightings &nbsp; "
+            "<span style='color:#E74C3C'>●</span> 5+ sightings &nbsp; "
+            "<span style='color:#BB88FF'>★</span> Manually flagged"
+        )
+        legend.setTextFormat(Qt.RichText)
+        legend.setStyleSheet("font-size: 10px; color: #777777; margin-top: 2px;")
+        layout.addWidget(legend)
+
+        btn_row = QHBoxLayout()
+
+        clear_sel_btn = QPushButton("✕  Clear Selected")
+        clear_sel_btn.clicked.connect(self._clear_selected)
+        btn_row.addWidget(clear_sel_btn)
+
+        clear_all_btn = QPushButton("🗑  Clear All Records")
+        clear_all_btn.setStyleSheet(
+            "QPushButton { background-color: #3A1A1A; border: 1px solid #883333; color: #FF7070; }"
+            "QPushButton:hover { background-color: #5A2222; }"
+        )
+        clear_all_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(clear_all_btn)
+
+        btn_row.addStretch()
+
+        log_btn = QPushButton("📂  Show Log File")
+        log_btn.clicked.connect(self._reveal_log)
+        btn_row.addWidget(log_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+
+    def _refresh(self):
+        self._model._items = self._log.get_offenders()
+        self._model.layoutChanged.emit()
+
+    def _clear_selected(self):
+        rows = sorted(
+            {self._proxy.mapToSource(idx).row()
+             for idx in self._table.selectionModel().selectedRows()},
+            reverse=True,
+        )
+        if not rows:
+            QMessageBox.information(self, "Nothing Selected", "Select one or more rows first.")
+            return
+        names = [self._model._items[r]["app_name"] for r in rows]
+        reply = QMessageBox.question(
+            self, "Clear Records",
+            f"Remove {len(names)} app(s) from the offenders log?\n\n" +
+            "\n".join(f"  • {n}" for n in names),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            for name in names:
+                self._log.clear_app(name)
+            self._refresh()
+
+    def _clear_all(self):
+        reply = QMessageBox.question(
+            self, "Clear All Records",
+            "Erase the entire offenders history?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._log.clear_all()
+            self._refresh()
+
+    def _reveal_log(self):
+        path = self._log.log_path
+        if path.exists():
+            try:
+                subprocess.run(["open", "-R", str(path)], check=False)
+            except Exception:
+                QMessageBox.information(self, "Log File", str(path))
+        else:
+            QMessageBox.information(
+                self, "Log File",
+                f"No log file yet.\nIt will be created at:\n{path}\n\nRun a scan first."
+            )
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QDialog { background-color: #2E2E2E; }
+            QPushButton {
+                background-color: #3A3A3A;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 6px 14px;
+                color: #E8E8E8;
+            }
+            QPushButton:hover { background-color: #4A4A4A; }
+            QTableView {
+                gridline-color: #3A3A3A;
+                border: 1px solid #3A3A3A;
+            }
+            QHeaderView::section {
+                background-color: #2A2A2A;
+                color: #CCCCCC;
+                border: 1px solid #3A3A3A;
+                padding: 4px;
+                font-size: 11px;
+            }
+        """)
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -1622,6 +2026,7 @@ class MainWindow(QMainWindow):
 
         self._items: list[dict] = []
         self._worker: Optional[ScanWorker] = None
+        self._offender_log = OffenderLog()
 
         self._build_ui()
         self._apply_dark_theme()
@@ -1763,6 +2168,20 @@ class MainWindow(QMainWindow):
         wins_btn.clicked.connect(self._show_quick_wins)
         ag_layout.addWidget(wins_btn)
         self._wins_btn = wins_btn
+
+        offenders_btn = QPushButton("🚨  Repeat Offenders")
+        offenders_btn.setToolTip(
+            "View apps spotted across multiple scans — data leakers, "
+            "cache hoarders, and general troublemakers"
+        )
+        offenders_btn.setStyleSheet(
+            "QPushButton { background-color: #2A1A3A; border: 1px solid #8B4AFF; "
+            "border-radius: 4px; padding: 6px; color: #BB88FF; font-weight: bold; }"
+            "QPushButton:hover { background-color: #3A2A5A; }"
+        )
+        offenders_btn.clicked.connect(self._show_repeat_offenders)
+        ag_layout.addWidget(offenders_btn)
+        self._offenders_btn = offenders_btn
 
         export_btn = QPushButton("⬇  Export CSV")
         export_btn.clicked.connect(self._export_csv)
@@ -2026,6 +2445,8 @@ class MainWindow(QMainWindow):
         self._wins_btn.setEnabled(bool(wins))
         self._update_title()
         self._charts.update_charts(self._visible_items())
+        self._offender_log.record_scan(self._items)
+        self._refresh_offenders_btn()
 
     def _quick_wins_items(self) -> list:
         safe = []
@@ -2054,6 +2475,26 @@ class MainWindow(QMainWindow):
         dlg.exec()
         for path in dlg.deleted_paths:
             self._remove_item(path)
+
+    def _refresh_offenders_btn(self):
+        count = self._offender_log.offender_count()
+        if count:
+            self._offenders_btn.setText(f"🚨  Repeat Offenders ({count})")
+        else:
+            self._offenders_btn.setText("🚨  Repeat Offenders")
+
+    def _show_repeat_offenders(self):
+        dlg = RepeatOffendersDialog(self._offender_log, parent=self)
+        dlg.exec()
+
+    def _flag_as_offender(self, item: dict):
+        self._offender_log.flag_app(item["app_name"])
+        self._refresh_offenders_btn()
+        QMessageBox.information(
+            self, "Flagged",
+            f"'{item['app_name']}' has been added to the Repeat Offenders watch list.\n\n"
+            "It will appear in the log with stats from all future scans.",
+        )
 
     def _update_title(self):
         total = sum(i["size_bytes"] for i in self._items)
@@ -2125,6 +2566,11 @@ class MainWindow(QMainWindow):
             trash_action = QAction("🗑  Move to Trash", self)
             trash_action.triggered.connect(lambda: self._confirm_trash(item))
             menu.addAction(trash_action)
+            menu.addSeparator()
+            flag_action = QAction("🚩  Flag as Offender", self)
+            flag_action.setToolTip("Add to Repeat Offenders watch list without deleting")
+            flag_action.triggered.connect(lambda: self._flag_as_offender(item))
+            menu.addAction(flag_action)
         else:
             total_size = sum(i["size_bytes"] for i in selected)
             header = QAction(f"{n} items selected  ({format_size(total_size)})", self)

@@ -99,7 +99,14 @@ Once the scan finishes, you'll see a list of folders sorted by size — biggest 
 ## Frequently Asked Questions
 
 **Q: Will this break my Mac?**
-No. The app only reads files — it never deletes anything on its own. You choose what to remove, one item at a time.
+The app itself won't — it never deletes anything automatically and it has no access to macOS system files. But *what you choose to delete* matters:
+
+- ✅ **macOS is safe** — this app only scans your user Library, not the operating system. You cannot accidentally wipe macOS with it.
+- ⚠️ **Apps can lose their settings** — deleting an App Support or Container folder while the app is installed can reset it to factory defaults, lose saved state, or require you to log in again. Most apps recover gracefully; some are more sensitive.
+- 🔴 **iOS Backups are real data** — if you delete a local iPhone/iPad backup and have no other copy, that data is gone. Verify you have a current iCloud or device backup before removing any iOS Backup.
+- 🟢 **Caches and Logs are always safe** — these are designed to be deleted. Apps rebuild them automatically.
+
+The risk labels in the app are there for a reason. Delete green items freely. Research yellow and red items before touching them. **When in doubt, leave it alone** — a few extra gigabytes is never worth a bad outcome.
 
 **Q: My "System Data" in Settings is 80 GB but the app only found 40 GB. Why?**
 Apple's "System Data" number includes things that require special system permissions to access. The app scans everything it *can* access. You can grant **Full Disk Access** to Terminal in System Settings → Privacy & Security → Full Disk Access for a more complete scan.
