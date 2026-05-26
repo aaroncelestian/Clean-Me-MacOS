@@ -1,4 +1,4 @@
-# Clean Me :) — macOS System Data Inspector
+# Clean Me — macOS System Data Inspector
 
 > **This is written for you — not for programmers.**
 > Think of this guide like advice from a knowledgeable friend who wants to help you reclaim space on your Mac without breaking anything.
