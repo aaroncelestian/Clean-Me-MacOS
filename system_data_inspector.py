@@ -66,12 +66,14 @@ _check_and_install_dependencies()
 
 import csv
 import json
+import plistlib
 from datetime import datetime
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QPushButton, QProgressBar, QLabel, QSlider, QCheckBox, QTableView,
+    QLineEdit, QListWidget,
     QHeaderView, QAbstractItemView, QMenu, QMessageBox, QSizePolicy,
     QScrollArea, QGroupBox, QFrame, QDialog,
 )
@@ -99,6 +101,7 @@ CATEGORY_COLORS = {
     "Snapshot":    "#9B59B6",
     "Trash":       "#95A5A6",
     "Container":   "#F39C12",
+    "Developer":   "#1ABC9C",
 }
 
 CLEANUP_ADVICE = {
@@ -282,6 +285,15 @@ CATEGORY_ADVICE = {
             "If the app is still installed: deleting resets it completely (like a fresh install)",
         ],
     },
+    "Developer": {
+        "risk": "caution",
+        "what": "Xcode build products, simulator devices, and iOS device support files. Large, and safe to remove only if you do not need those builds or simulators.",
+        "steps": [
+            "Derived Data can be deleted: Xcode rebuilds it",
+            "Old device-support folders are leftovers from iPhones you plugged in",
+            "Removing CoreSimulator devices deletes those simulators",
+        ],
+    },
 }
 
 RISK_COLORS = {
@@ -305,7 +317,15 @@ SCAN_TARGETS = [
     (Path("~/Library/Application Support/MobileSync/Backup").expanduser(), "iOS Backup"),
     (Path("~/.Trash").expanduser(),                                        "Trash"),
     (Path("/private/var/folders"),                                          "Cache"),
+    (Path("~/Library/Developer").expanduser(),                             "Developer"),
 ]
+
+# Flags macOS uses to stop a file from being removed.
+# UF_IMMUTABLE, UF_APPEND, SF_IMMUTABLE, SF_APPEND, SF_RESTRICTED, SF_NOUNLINK.
+MACOS_PROTECT_FLAGS = 0x00000002 | 0x00000004 | 0x00020000 | 0x00040000 | 0x00080000 | 0x00100000
+VAR_FOLDERS = Path("/private/var/folders")
+DEVELOPER_ROOT = Path("~/Library/Developer").expanduser()
+DATA_VOLUME = Path("/System/Volumes/Data")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -461,9 +481,14 @@ class OffenderLog:
         for item in items:
             name = item["app_name"]
             if name not in by_app:
-                by_app[name] = {"size_bytes": 0, "categories": set()}
+                by_app[name] = {"size_bytes": 0, "categories": set(), "locations": []}
             by_app[name]["size_bytes"] += item["size_bytes"]
             by_app[name]["categories"].add(item["category"])
+            by_app[name]["locations"].append({
+                "path": item["path"],
+                "category": item["category"],
+                "size_bytes": item["size_bytes"],
+            })
 
         apps = self._data["apps"]
         for name, agg in by_app.items():
@@ -476,12 +501,16 @@ class OffenderLog:
                     "notes": "",
                     "flagged": False,
                     "scan_history": [],
+                    "locations": [],
                 }
             entry = apps[name]
             entry["times_seen"] += 1
             entry["last_seen"] = now
             entry["categories"] = sorted(
                 set(entry["categories"]) | agg["categories"]
+            )
+            entry["locations"] = sorted(
+                agg["locations"], key=lambda loc: loc["size_bytes"], reverse=True
             )
             entry["scan_history"].append({
                 "date": now,
@@ -506,6 +535,7 @@ class OffenderLog:
                 "notes": note,
                 "flagged": True,
                 "scan_history": [],
+                "locations": [],
             }
         else:
             apps[app_name]["flagged"] = True
@@ -520,6 +550,17 @@ class OffenderLog:
 
     def clear_all(self):
         self._data["apps"] = {}
+        self._save()
+
+    def forget_locations(self, app_name: str, paths: list):
+        """Drop trashed folders from the last known footprint of an app."""
+        entry = self._data["apps"].get(app_name)
+        if not entry:
+            return
+        drop = set(paths)
+        entry["locations"] = [
+            loc for loc in entry.get("locations", []) if loc.get("path") not in drop
+        ]
         self._save()
 
     def get_offenders(self) -> list:
@@ -548,6 +589,7 @@ class OffenderLog:
                 "trend": trend,
                 "flagged": entry.get("flagged", False),
                 "notes": entry.get("notes", ""),
+                "locations": list(entry.get("locations") or []),
             })
         result.sort(key=lambda x: (-x["times_seen"], -x["peak_size_bytes"]))
         return result
@@ -558,6 +600,24 @@ class OffenderLog:
             1 for e in self._data["apps"].values()
             if e["times_seen"] >= 2 or e.get("flagged")
         )
+
+    def previous_size(self, app_name: str):
+        """Size from the scan before the latest one, or None if this is the first."""
+        history = self._data["apps"].get(app_name, {}).get("scan_history", [])
+        if len(history) < 2:
+            return None
+        return history[-2].get("size_bytes")
+
+    def is_ignored(self, app_name: str) -> bool:
+        return app_name in self._data.setdefault("ignored_apps", [])
+
+    def set_ignored(self, app_name: str, ignored: bool):
+        names = self._data.setdefault("ignored_apps", [])
+        if ignored and app_name not in names:
+            names.append(app_name)
+        elif not ignored and app_name in names:
+            names.remove(app_name)
+        self._save()
 
     @property
     def log_path(self) -> Path:
@@ -581,6 +641,8 @@ class ScanWorker(QThread):
         self._files_scanned = 0
         self._items_found = 0
         self._bytes_found = 0
+        self.protected_kept: list[str] = []
+        self.volume_report: dict = {"purgeable_bytes": 0, "snapshots": []}
 
     def abort(self):
         self._abort = True
@@ -640,33 +702,13 @@ class ScanWorker(QThread):
             if not base_path.exists():
                 continue
 
-            is_var_folders = str(base_path) == "/private/var/folders"
-            max_depth = 4 if is_var_folders else None
-
             self.progress.emit(f"Scanning {base_path} …")
 
-            if is_var_folders:
-                # Only iterate one level of sub-dirs to keep it manageable
-                try:
-                    with os.scandir(base_path) as it:
-                        for entry in it:
-                            if self._abort:
-                                break
-                            if entry.is_dir(follow_symlinks=False):
-                                try:
-                                    with os.scandir(entry.path) as it2:
-                                        for sub in it2:
-                                            if self._abort:
-                                                break
-                                            if sub.is_dir(follow_symlinks=False):
-                                                self._scan_subdir(
-                                                    Path(sub.path), category,
-                                                    max_depth=2
-                                                )
-                                except (PermissionError, OSError):
-                                    pass
-                except (PermissionError, OSError) as e:
-                    self.progress.emit(f"⚠ Permission denied: {base_path}")
+            if base_path == VAR_FOLDERS:
+                self._scan_var_folders(base_path, category)
+                continue
+            if base_path == DEVELOPER_ROOT:
+                self._scan_developer(base_path, category)
                 continue
 
             # Regular top-level scan: each immediate child becomes one item
@@ -684,6 +726,9 @@ class ScanWorker(QThread):
                     p = Path(entry.path)
                     if entry.is_symlink():
                         continue
+                    if _is_protected_by_macos(p):
+                        self._note_protected(p)
+                        continue
                     if entry.is_dir(follow_symlinks=False):
                         self._scan_subdir(p, category, max_depth=None)
                     elif entry.is_file(follow_symlinks=False):
@@ -699,7 +744,125 @@ class ScanWorker(QThread):
 
         self.finished.emit()
 
+    def _scan_var_folders(self, base_path: Path, category: str):
+        """List deletable caches inside /private/var/folders.
+
+        Layout is <2-char>/<per-user-id>/{C,T,0,X}. The per-user directory
+        and C/T/0/X carry SF_NOUNLINK, so Finder refuses them with
+        "required by macOS". Reclaimable caches are the children of C/.
+        """
+        uid = os.getuid()
+        try:
+            prefixes = list(os.scandir(base_path))
+        except (PermissionError, OSError):
+            self.progress.emit(f"⚠ Permission denied: {base_path}")
+            return
+
+        for prefix in prefixes:
+            if self._abort:
+                return
+            if not prefix.is_dir(follow_symlinks=False):
+                continue
+            try:
+                user_dirs = list(os.scandir(prefix.path))
+            except (PermissionError, OSError):
+                continue
+            for user_dir in user_dirs:
+                if self._abort:
+                    return
+                if not user_dir.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    if user_dir.stat(follow_symlinks=False).st_uid != uid:
+                        continue
+                except OSError:
+                    continue
+                cache_dir = Path(user_dir.path) / "C"
+                try:
+                    children = list(os.scandir(cache_dir))
+                except (PermissionError, OSError):
+                    continue
+                for child in children:
+                    if self._abort:
+                        return
+                    try:
+                        if child.is_symlink():
+                            continue
+                        st = child.stat(follow_symlinks=False)
+                        if st.st_flags & MACOS_PROTECT_FLAGS:
+                            self._note_protected(Path(child.path))
+                            continue
+                        p = Path(child.path)
+                        if child.is_dir(follow_symlinks=False):
+                            self._scan_subdir(p, category, max_depth=None)
+                        else:
+                            self._emit_item(p, st.st_size, category, p.name)
+                    except (PermissionError, OSError):
+                        pass
+
+    def _note_protected(self, path: Path):
+        self.protected_kept.append(path.name)
+
+    def _scan_developer(self, root: Path, category: str):
+        """List Xcode and simulator folders without merging them into one blob."""
+        xcode = root / "Xcode"
+        named = [
+            xcode / "DerivedData",
+            xcode / "iOS DeviceSupport",
+            xcode / "watchOS DeviceSupport",
+            xcode / "tvOS DeviceSupport",
+            xcode / "Archives",
+            xcode / "Products",
+            root / "CoreSimulator",
+        ]
+        seen = {path.resolve() for path in named if path.exists()}
+        for path in named:
+            if self._abort:
+                return
+            if path.is_dir():
+                self._scan_subdir(path, category)
+        if xcode.is_dir():
+            try:
+                children = list(xcode.iterdir())
+            except OSError:
+                children = []
+            for child in children:
+                if self._abort:
+                    return
+                try:
+                    if child.is_symlink() or child.resolve() in seen:
+                        continue
+                    if _is_protected_by_macos(child):
+                        self._note_protected(child)
+                        continue
+                    if child.is_dir():
+                        self._scan_subdir(child, category)
+                except OSError:
+                    pass
+        try:
+            top = list(root.iterdir())
+        except OSError:
+            top = []
+        for child in top:
+            if self._abort:
+                return
+            try:
+                if child.name == "Xcode" or child.is_symlink():
+                    continue
+                if child.resolve() in seen:
+                    continue
+                if _is_protected_by_macos(child):
+                    self._note_protected(child)
+                    continue
+                if child.is_dir():
+                    self._scan_subdir(child, category)
+            except OSError:
+                pass
+
     def _scan_subdir(self, path: Path, category: str, max_depth: int = None):
+        if _is_protected_by_macos(path):
+            self._note_protected(path)
+            return
         self.progress.emit(
             f"{self._items_found} items ({format_size(self._bytes_found)}) "
             f"— sizing {path.name}…"
@@ -708,6 +871,9 @@ class ScanWorker(QThread):
         self._emit_item(path, size, category, path.name)
 
     def _emit_item(self, path: Path, size: int, category: str, folder_name: str):
+        if _is_protected_by_macos(path):
+            self._note_protected(path)
+            return
         if size < self._min_size:
             return
         try:
@@ -728,24 +894,16 @@ class ScanWorker(QThread):
         })
 
     def _scan_snapshots(self):
-        try:
-            result = subprocess.run(
-                ["tmutil", "listlocalsnapshots", "/"],
-                capture_output=True, text=True, timeout=10
-            )
-            for line in result.stdout.strip().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                self.item_found.emit({
-                    "path": line,
-                    "size_bytes": 0,
-                    "category": "Snapshot",
-                    "app_name": "Time Machine",
-                    "last_modified": datetime.now(),
-                })
-        except Exception:
-            pass
+        report = volume_report()
+        self.volume_report = report
+        for snap in report["snapshots"]:
+            self.item_found.emit({
+                "path": snap["name"],
+                "size_bytes": snap["size_bytes"],
+                "category": "Snapshot",
+                "app_name": "Time Machine",
+                "last_modified": datetime.now(),
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -783,11 +941,21 @@ class ScanTableModel(QAbstractTableModel):
         col = index.column()
 
         if role == Qt.DisplayRole:
-            if col == COL_APP:   return item["app_name"]
+            if col == COL_APP:
+                name = item["app_name"]
+                if item.get("grew_bytes"):
+                    name = f"↑ {name}"
+                return name
             if col == COL_CAT:   return item["category"]
             if col == COL_SIZE:  return format_size(item["size_bytes"])
             if col == COL_MTIME: return item["last_modified"].strftime("%Y-%m-%d %H:%M")
-            if col == COL_PATH:  return item["path"]
+            if col == COL_PATH:
+                folders = item.get("folders") or []
+                if len(folders) > 1:
+                    return f"{len(folders)} folders"
+                return item["path"]
+        if role == Qt.ToolTipRole and col == COL_APP and item.get("grew_bytes"):
+            return f"Grew {format_size(item['grew_bytes'])} since the last scan"
 
         if role == Qt.BackgroundRole:
             cat = item["category"]
@@ -956,34 +1124,225 @@ def _age_analysis(last_modified: "datetime", risk: str) -> tuple:
     )
 
 
+def _iter_app_bundles():
+    """User-installable .app bundles in /Applications and ~/Applications.
+
+    Walks one folder deeper so apps in Utilities and vendor folders are found.
+    System apps under /System are skipped so they cannot be uninstalled here.
+    """
+    roots = [Path("/Applications"), Path.home() / "Applications"]
+    found = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.suffix == ".app" and entry.is_dir():
+                    found.append(entry)
+                elif entry.is_dir() and not entry.name.startswith("."):
+                    for child in entry.iterdir():
+                        if child.suffix == ".app" and child.is_dir():
+                            found.append(child)
+            except OSError:
+                continue
+    return found
+
+
+def _app_match_score(app_name: str, bundle: Path) -> int:
+    """Higher is a closer name match. 0 means do not treat it as this app."""
+    wanted = app_name.lower().strip()
+    stem = bundle.stem.lower().strip()
+    if not wanted or not stem:
+        return 0
+    if stem == wanted:
+        return 100
+    compact_wanted = wanted.replace(" ", "")
+    compact_stem = stem.replace(" ", "")
+    if compact_stem == compact_wanted:
+        return 90
+    if len(wanted) >= 4 and (stem.startswith(wanted) or wanted.startswith(stem)):
+        return 70
+    if len(wanted) >= 5:
+        idx = stem.find(wanted)
+        if idx == 0 or (idx > 0 and not stem[idx - 1].isalnum()):
+            return 40
+    return 0
+
+
+def _find_installed_apps(app_name: str) -> list:
+    """Installed .app paths that belong to this name, best match first.
+
+    A loose substring hit is returned only when it is the single candidate,
+    so uninstall never guesses between two different apps.
+    """
+    scored = []
+    for bundle in _iter_app_bundles():
+        score = _app_match_score(app_name, bundle)
+        if score:
+            scored.append((score, str(bundle)))
+    scored.sort(key=lambda pair: (-pair[0], pair[1].lower()))
+    strong = [path for score, path in scored if score >= 70]
+    if strong:
+        return strong
+    weak = [path for score, path in scored if score > 0]
+    if len(weak) == 1:
+        return weak
+    return []
+
+
 def _is_app_installed(app_name: str) -> tuple:
     """
     Returns (installed: bool, app_path: str | None).
     Checks /Applications and ~/Applications for a matching .app bundle.
     """
-    search_dirs = [Path("/Applications"), Path("~/Applications").expanduser()]
-    name_lower = app_name.lower()
-    for d in search_dirs:
-        try:
-            for entry in d.iterdir():
-                if entry.suffix == ".app" and name_lower in entry.stem.lower():
-                    return True, str(entry)
-        except OSError:
-            pass
+    matches = _find_installed_apps(app_name)
+    if matches:
+        return True, matches[0]
     return False, None
 
 
-def _move_to_trash_mac(path: str) -> bool:
-    """Move a path to macOS Trash via Finder (handles protected Containers dirs)."""
+def _is_protected_by_macos(path: Path) -> bool:
+    """True when macOS has marked the path required, restricted, or immutable."""
     try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             f'tell application "Finder" to delete POSIX file "{path}"'],
-            capture_output=True, text=True, timeout=30,
-        )
-        return result.returncode == 0
-    except Exception:
+        return bool(path.lstat().st_flags & MACOS_PROTECT_FLAGS)
+    except OSError:
         return False
+
+
+def _parse_bytes(text: str) -> int:
+    match = re.search(r"\((\d+)\s+Bytes\)", text)
+    return int(match.group(1)) if match else 0
+
+
+def volume_report() -> dict:
+    """Purgeable space and local APFS snapshots, with sizes when macOS reports them."""
+    purgeable = 0
+    try:
+        info = subprocess.run(
+            ["diskutil", "info", str(DATA_VOLUME)],
+            capture_output=True, text=True, timeout=15,
+        )
+        for line in info.stdout.splitlines():
+            if "purgeable" in line.lower():
+                purgeable = max(purgeable, _parse_bytes(line))
+    except Exception:
+        pass
+
+    snapshots = []
+    seen = set()
+    for target in (str(DATA_VOLUME), "/"):
+        try:
+            result = subprocess.run(
+                ["diskutil", "apfs", "listSnapshots", target, "-plist"],
+                capture_output=True, timeout=15,
+            )
+            if result.returncode != 0 or not result.stdout:
+                continue
+            payload = plistlib.loads(result.stdout)
+        except Exception:
+            continue
+        for snap in payload.get("Snapshots") or []:
+            name = snap.get("SnapshotName") or snap.get("Name") or ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            size = 0
+            for key, value in snap.items():
+                if isinstance(value, int) and "size" in key.lower():
+                    size = max(size, value)
+            snapshots.append({"name": name, "size_bytes": size})
+
+    if not snapshots:
+        try:
+            listed = subprocess.run(
+                ["tmutil", "listlocalsnapshots", "/"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in listed.stdout.splitlines():
+                name = line.strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    snapshots.append({"name": name, "size_bytes": 0})
+        except Exception:
+            pass
+    return {"purgeable_bytes": purgeable, "snapshots": snapshots}
+
+
+def system_data_line(scanned_bytes: int, report: dict) -> str:
+    """'Found X of about Y' when macOS reports purgeable space or snapshot sizes."""
+    snaps = report.get("snapshots") or []
+    purgeable = report.get("purgeable_bytes") or 0
+    snap_bytes = sum(s.get("size_bytes") or 0 for s in snaps)
+    extra = purgeable if purgeable else snap_bytes
+    if extra:
+        line = (
+            f"Found {format_size(scanned_bytes)} of about {format_size(scanned_bytes + extra)} "
+            f"in System Data ({format_size(extra)} purgeable or in local snapshots)."
+        )
+    else:
+        line = f"Found {format_size(scanned_bytes)} in this scan."
+    if snaps and not snap_bytes:
+        line += f" {len(snaps)} local snapshot(s); macOS did not report their size."
+    return line
+
+
+def _finder_delete(paths: list[str]) -> tuple[bool, str]:
+    """Move paths to the Trash via Finder. Returns (ok, error detail)."""
+    if not paths:
+        return True, ""
+    for start in range(0, len(paths), 40):
+        chunk = paths[start:start + 40]
+        lines = ['tell application "Finder"', "delete {"]
+        for p in chunk:
+            escaped = p.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'POSIX file "{escaped}",')
+        lines.extend(["}", "end tell"])
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", "\n".join(lines)],
+                capture_output=True, text=True, timeout=120,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Finder could not move the item to the Trash.").strip()
+            return False, detail
+    return True, ""
+
+
+def _move_to_trash_mac(path: str) -> tuple[bool, str]:
+    """Move a path to the Trash. Protected items are refused and left untouched."""
+    p = Path(path)
+    if _is_protected_by_macos(p):
+        return False, (
+            f"“{p.name}” can’t be deleted because it is required by macOS."
+        )
+    if not p.exists():
+        return False, "That item is no longer there."
+    return _finder_delete([path])
+
+
+def _reveal_path(path: str):
+    """Show a file or folder in Finder."""
+    try:
+        subprocess.run(["open", "-R", path], check=False)
+    except Exception as exc:
+        QMessageBox.warning(None, "Error", f"Could not open Finder:\n{exc}")
+
+
+def _confirm_remove_app(parent, app_name: str, app_path: str) -> bool:
+    reply = QMessageBox.question(
+        parent, "Remove App",
+        f"Move {app_name} to the Trash?\n\n{app_path}\n\n"
+        "The app can be restored from the Trash until you empty it. "
+        "Leftover caches and support files stay on disk until you remove those separately.",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+    )
+    return reply == QMessageBox.Yes
 
 
 # ---------------------------------------------------------------------------
@@ -999,12 +1358,14 @@ class CleanupAdviceDialog(QDialog):
         self.setModal(True)
         self._item = item
         self.deleted = False
+        self.deleted_paths: list[str] = []
         self._build_ui()
         self._apply_style()
 
     def _get_advice(self) -> dict:
         app_key = self._item["app_name"].lower()
-        cat = self._item["category"]
+        folders = self._item.get("folders") or [self._item]
+        cat = folders[0].get("category", self._item["category"])
         return CLEANUP_ADVICE.get(app_key) or CATEGORY_ADVICE.get(cat, {
             "risk": "caution",
             "what": "No specific advice available for this item.",
@@ -1103,6 +1464,22 @@ class CleanupAdviceDialog(QDialog):
         inst_sub_lbl.setWordWrap(True)
         inst_layout.addWidget(inst_head)
         inst_layout.addWidget(inst_sub_lbl)
+        if installed and app_path:
+            app_btns = QHBoxLayout()
+            app_btns.setContentsMargins(0, 4, 0, 0)
+            find_app_btn = QPushButton("📂  Find App")
+            find_app_btn.clicked.connect(lambda: _reveal_path(app_path))
+            remove_app_btn = QPushButton("🗑  Remove App")
+            remove_app_btn.setStyleSheet(
+                "QPushButton { background-color: #5A1A1A; border: 1px solid #993333; "
+                "color: #FF7070; font-weight: bold; }"
+                "QPushButton:hover { background-color: #7A2222; }"
+            )
+            remove_app_btn.clicked.connect(lambda: self._on_remove_app(app_path))
+            app_btns.addWidget(find_app_btn)
+            app_btns.addWidget(remove_app_btn)
+            app_btns.addStretch()
+            inst_layout.addLayout(app_btns)
         layout.addWidget(inst_frame)
 
         # What is this
@@ -1125,8 +1502,12 @@ class CleanupAdviceDialog(QDialog):
             layout.addWidget(step_lbl)
 
         # Path
-        layout.addWidget(self._section("Path:"))
-        path_lbl = QLabel(self._item["path"])
+        layout.addWidget(self._section("Folders:"))
+        folder_lines = "\n".join(
+            f"{format_size(f['size_bytes'])}  {f['category']}  {f['path']}"
+            for f in (self._item.get("folders") or [self._item])
+        )
+        path_lbl = QLabel(folder_lines)
         path_lbl.setWordWrap(True)
         path_lbl.setStyleSheet(
             "font-size: 10px; color: #777777; font-family: monospace; "
@@ -1190,24 +1571,41 @@ class CleanupAdviceDialog(QDialog):
         """)
 
     def _on_trash(self):
-        path = self._item["path"]
+        folders = self._item.get("folders") or [self._item]
         reply = QMessageBox.question(
             self, "Confirm Delete",
-            f"Move to Trash?\n\n{Path(path).name}\n({format_size(self._item['size_bytes'])})",
+            f"Move to Trash?\n\n{self._item['app_name']}\n({format_size(self._item['size_bytes'])})",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
-            if _move_to_trash_mac(path):
-                self.deleted = True
-                self.accept()
+        if reply != QMessageBox.Yes:
+            return
+        self.deleted_paths = []
+        failed = []
+        for folder in folders:
+            ok, detail = _move_to_trash_mac(folder["path"])
+            if ok:
+                self.deleted_paths.append(folder["path"])
             else:
-                QMessageBox.critical(
-                    self, "Error",
-                    "Could not move to Trash.\n\n"
-                    "Try 'Reveal in Finder' and deleting manually.\n\n"
-                    "Note: macOS-protected folders (like Containers) must be\n"
-                    "deleted via Finder, not Terminal.",
-                )
+                failed.append(detail or folder["path"])
+        if self.deleted_paths:
+            self.deleted = True
+        if failed:
+            QMessageBox.critical(self, "Error", "\n".join(failed))
+        if self.deleted:
+            self.accept()
+
+    def _on_remove_app(self, app_path: str):
+        if not _confirm_remove_app(self, self._item["app_name"], app_path):
+            return
+        ok, detail = _move_to_trash_mac(app_path)
+        if ok:
+            QMessageBox.information(
+                self, "App Moved to Trash",
+                detail or f"{Path(app_path).name} is in the Trash.\n\n"
+                "Its leftover data is still on disk until you remove that too.",
+            )
+        else:
+            QMessageBox.critical(self, "Error", detail or "Could not move the app to Trash.")
 
     def _on_reveal(self):
         try:
@@ -1401,27 +1799,34 @@ class QuickWinsDialog(QDialog):
             return
 
         failed = []
+        failed_names = set()
+        notes = []
         for cb, item in to_delete:
-            if _move_to_trash_mac(item["path"]):
+            ok, detail = _move_to_trash_mac(item["path"])
+            if ok:
                 self.deleted_paths.append(item["path"])
                 cb.setEnabled(False)
                 cb.setChecked(False)
+                if detail:
+                    notes.append(detail)
             else:
-                failed.append(item["app_name"])
+                failed_names.add(item["app_name"])
+                failed.append(f"{item['app_name']}: {detail}" if detail else item["app_name"])
 
         self._update_savings()
         freed = total_size - sum(
             item["size_bytes"] for _, item in to_delete
-            if item["app_name"] in failed
+            if item["app_name"] in failed_names
         )
 
         if failed:
             QMessageBox.warning(
                 self, "Some Items Failed",
-                "Could not move to Trash:\n• " + "\n• ".join(failed) +
-                "\n\nTry 'Reveal in Finder' for these and delete manually.",
+                "Could not move to Trash:\n• " + "\n• ".join(failed),
             )
         else:
+            if notes:
+                QMessageBox.information(self, "Moved to Trash", "\n\n".join(notes))
             QMessageBox.information(
                 self, "Done",
                 f"Moved {len(to_delete) - len(failed)} items to Trash.\n"
@@ -1861,14 +2266,245 @@ class OffenderTableModel(QAbstractTableModel):
         return None
 
 
+def _locations_for_app(app_name: str, logged: list, scan_items: list) -> list:
+    """Folders for an app, preferring the current scan over the saved log."""
+    live = [
+        {"path": item["path"], "category": item["category"], "size_bytes": item["size_bytes"]}
+        for item in scan_items
+        if item.get("app_name") == app_name
+    ]
+    source = live or list(logged or [])
+    seen = set()
+    locations = []
+    for loc in sorted(source, key=lambda row: row.get("size_bytes", 0), reverse=True):
+        path = loc.get("path")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        locations.append(loc)
+    return locations
+
+
+class OffenderManageDialog(QDialog):
+    """Find or remove one offender's application and the folders it left behind."""
+
+    def __init__(self, offender: dict, locations: list, parent=None):
+        super().__init__(parent)
+        self._offender = offender
+        self._locations = locations
+        self._apps = _find_installed_apps(offender["app_name"])
+        self.deleted_paths: list[str] = []
+        self.removed_app = False
+        self.setWindowTitle(f"Find or Remove — {offender['app_name']}")
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(420)
+        self.setModal(True)
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 14)
+
+        title = QLabel(self._offender["app_name"])
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #E8E8E8;")
+        layout.addWidget(title)
+
+        app_group = QGroupBox("The program")
+        app_layout = QVBoxLayout(app_group)
+        if self._apps:
+            self._app_checks = []
+            for path in self._apps:
+                cb = QCheckBox(path)
+                cb.setChecked(len(self._apps) == 1)
+                cb.setStyleSheet("font-size: 11px; color: #E0E0E0;")
+                app_layout.addWidget(cb)
+                self._app_checks.append(cb)
+            app_btns = QHBoxLayout()
+            find_btn = QPushButton("📂  Find App")
+            find_btn.clicked.connect(self._find_apps)
+            remove_btn = QPushButton("🗑  Remove App")
+            remove_btn.setStyleSheet(
+                "QPushButton { background-color: #5A1A1A; border: 1px solid #993333; color: #FF7070; }"
+                "QPushButton:hover { background-color: #7A2222; }"
+            )
+            remove_btn.clicked.connect(self._remove_apps)
+            app_btns.addWidget(find_btn)
+            app_btns.addWidget(remove_btn)
+            app_btns.addStretch()
+            app_layout.addLayout(app_btns)
+        else:
+            missing = QLabel(
+                "Not installed in /Applications or your personal Applications folder. "
+                "What remains is leftover data."
+            )
+            missing.setWordWrap(True)
+            missing.setStyleSheet("font-size: 11px; color: #AAAAAA;")
+            app_layout.addWidget(missing)
+            self._app_checks = []
+        layout.addWidget(app_group)
+
+        data_group = QGroupBox("Its data")
+        data_layout = QVBoxLayout(data_group)
+        self._data_checks = []
+        if self._locations:
+            for loc in self._locations:
+                exists = Path(loc["path"]).exists()
+                label = f"{format_size(loc.get('size_bytes', 0))}   {loc.get('category', '')}   {loc['path']}"
+                cb = QCheckBox(label)
+                cb.setChecked(exists)
+                cb.setEnabled(exists)
+                if not exists:
+                    cb.setText(label + "   (already gone)")
+                cb.setStyleSheet("font-size: 11px; color: #E0E0E0;")
+                data_layout.addWidget(cb)
+                self._data_checks.append((cb, loc))
+            data_btns = QHBoxLayout()
+            find_data = QPushButton("📂  Find Data")
+            find_data.clicked.connect(self._find_data)
+            remove_data = QPushButton("🗑  Remove Data")
+            remove_data.setStyleSheet(
+                "QPushButton { background-color: #5A1A1A; border: 1px solid #993333; color: #FF7070; }"
+                "QPushButton:hover { background-color: #7A2222; }"
+            )
+            remove_data.clicked.connect(self._remove_data)
+            data_btns.addWidget(find_data)
+            data_btns.addWidget(remove_data)
+            data_btns.addStretch()
+            data_layout.addLayout(data_btns)
+        else:
+            empty = QLabel(
+                "No folders recorded yet. Run a scan, then open this app again to locate its data."
+            )
+            empty.setWordWrap(True)
+            empty.setStyleSheet("font-size: 11px; color: #AAAAAA;")
+            data_layout.addWidget(empty)
+        layout.addWidget(data_group)
+
+        layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+    def _checked_apps(self) -> list:
+        return [cb.text() for cb in self._app_checks if cb.isChecked() and cb.isEnabled()]
+
+    def _checked_data(self) -> list:
+        return [loc for cb, loc in self._data_checks if cb.isChecked() and cb.isEnabled()]
+
+    def _find_apps(self):
+        paths = self._checked_apps()
+        if not paths:
+            QMessageBox.information(self, "Nothing Selected", "Select an app to reveal in Finder.")
+            return
+        for path in paths:
+            _reveal_path(path)
+
+    def _remove_apps(self):
+        paths = self._checked_apps()
+        if not paths:
+            QMessageBox.information(self, "Nothing Selected", "Select an app to remove.")
+            return
+        names = "\n".join(f"  • {p}" for p in paths)
+        reply = QMessageBox.question(
+            self, "Remove App",
+            f"Move {len(paths)} app(s) to the Trash?\n\n{names}\n\n"
+            "You can restore them until you empty the Trash. Leftover data stays until you remove it below.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        failed = []
+        for cb in self._app_checks:
+            if not cb.isChecked() or not cb.isEnabled():
+                continue
+            ok, detail = _move_to_trash_mac(cb.text())
+            if ok:
+                cb.setEnabled(False)
+                cb.setChecked(False)
+                cb.setText(cb.text() + "   (moved to Trash)")
+                self.removed_app = True
+            else:
+                failed.append(detail or cb.text())
+        if failed:
+            QMessageBox.warning(self, "Some Apps Failed", "\n".join(failed))
+
+    def _find_data(self):
+        locs = self._checked_data()
+        if not locs:
+            QMessageBox.information(self, "Nothing Selected", "Select a folder to reveal in Finder.")
+            return
+        for loc in locs:
+            _reveal_path(loc["path"])
+
+    def _remove_data(self):
+        locs = self._checked_data()
+        if not locs:
+            QMessageBox.information(self, "Nothing Selected", "Select folders to remove.")
+            return
+        total = sum(loc.get("size_bytes", 0) for loc in locs)
+        names = "\n".join(f"  • {Path(loc['path']).name}" for loc in locs[:8])
+        if len(locs) > 8:
+            names += f"\n  … and {len(locs) - 8} more"
+        reply = QMessageBox.question(
+            self, "Remove Data",
+            f"Move {len(locs)} folder(s) ({format_size(total)}) to the Trash?\n\n{names}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        failed = []
+        for cb, loc in self._data_checks:
+            if not cb.isChecked() or not cb.isEnabled():
+                continue
+            ok, detail = _move_to_trash_mac(loc["path"])
+            if ok:
+                self.deleted_paths.append(loc["path"])
+                cb.setEnabled(False)
+                cb.setChecked(False)
+                cb.setText(cb.text() + "   (moved to Trash)")
+            else:
+                failed.append(f"{Path(loc['path']).name}: {detail}" if detail else Path(loc["path"]).name)
+        if failed:
+            QMessageBox.warning(self, "Some Folders Failed", "Could not move to Trash:\n• " + "\n• ".join(failed))
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QDialog { background-color: #2E2E2E; }
+            QGroupBox {
+                color: #888888;
+                border: 1px solid #444444;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 6px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QPushButton {
+                background-color: #3A3A3A;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 6px 14px;
+                color: #E8E8E8;
+            }
+            QPushButton:hover { background-color: #4A4A4A; }
+            QCheckBox { color: #E8E8E8; }
+            QLabel { background: transparent; }
+        """)
+
+
 class RepeatOffendersDialog(QDialog):
-    def __init__(self, offender_log: OffenderLog, parent=None):
+    def __init__(self, offender_log: OffenderLog, scan_items=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🚨  Repeat Offenders Log")
         self.setMinimumWidth(820)
         self.setMinimumHeight(540)
         self.setModal(True)
         self._log = offender_log
+        self._scan_items = list(scan_items or [])
+        self.deleted_paths: list[str] = []
         self._build_ui()
         self._apply_style()
 
@@ -1882,8 +2518,8 @@ class RepeatOffendersDialog(QDialog):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Apps spotted across multiple scans — data hoarders, cache leakers, and general troublemakers. "
-            "Use this to decide which apps to investigate or uninstall."
+            "Apps spotted across multiple scans. Select one, then Find or Remove "
+            "to open the program in Finder or move it — and its leftover data — to the Trash."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("font-size: 11px; color: #AAAAAA; margin-bottom: 4px;")
@@ -1903,6 +2539,7 @@ class RepeatOffendersDialog(QDialog):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._table.verticalHeader().setVisible(False)
         self._table.sortByColumn(_OFF_SEEN, Qt.DescendingOrder)
+        self._table.doubleClicked.connect(lambda _idx: self._manage_selected())
         layout.addWidget(self._table)
 
         legend = QLabel(
@@ -1916,6 +2553,14 @@ class RepeatOffendersDialog(QDialog):
         layout.addWidget(legend)
 
         btn_row = QHBoxLayout()
+
+        manage_btn = QPushButton("Find or Remove…")
+        manage_btn.setStyleSheet(
+            "QPushButton { background-color: #1A2A3A; border: 1px solid #4A90D9; color: #4A90D9; font-weight: bold; }"
+            "QPushButton:hover { background-color: #1E3A5A; }"
+        )
+        manage_btn.clicked.connect(self._manage_selected)
+        btn_row.addWidget(manage_btn)
 
         clear_sel_btn = QPushButton("✕  Clear Selected")
         clear_sel_btn.clicked.connect(self._clear_selected)
@@ -1944,6 +2589,36 @@ class RepeatOffendersDialog(QDialog):
     def _refresh(self):
         self._model._items = self._log.get_offenders()
         self._model.layoutChanged.emit()
+
+    def _selected_offenders(self) -> list:
+        rows = sorted({
+            self._proxy.mapToSource(idx).row()
+            for idx in self._table.selectionModel().selectedRows()
+        })
+        return [self._model._items[r] for r in rows if 0 <= r < len(self._model._items)]
+
+    def _manage_selected(self):
+        selected = self._selected_offenders()
+        if len(selected) != 1:
+            QMessageBox.information(
+                self, "Select One App",
+                "Select a single app, then choose Find or Remove.",
+            )
+            return
+        offender = selected[0]
+        locations = _locations_for_app(
+            offender["app_name"], offender.get("locations") or [], self._scan_items
+        )
+        dlg = OffenderManageDialog(offender, locations, parent=self)
+        dlg.exec()
+        if dlg.deleted_paths:
+            self.deleted_paths.extend(dlg.deleted_paths)
+            self._log.forget_locations(offender["app_name"], dlg.deleted_paths)
+            self._scan_items = [
+                item for item in self._scan_items
+                if item.get("path") not in set(dlg.deleted_paths)
+            ]
+            self._refresh()
 
     def _clear_selected(self):
         rows = sorted(
@@ -2135,6 +2810,17 @@ class MainWindow(QMainWindow):
         self._size_slider.valueChanged.connect(self._on_slider_changed)
         fg_layout.addWidget(self._size_slider)
 
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search apps or paths")
+        self._search.textChanged.connect(self._apply_filters)
+        fg_layout.addWidget(self._search)
+
+        self._hide_ignored = QCheckBox("Hide set-aside")
+        self._hide_ignored.setChecked(True)
+        self._hide_ignored.setToolTip("Apps you marked Leave this alone")
+        self._hide_ignored.stateChanged.connect(self._apply_filters)
+        fg_layout.addWidget(self._hide_ignored)
+
         layout.addWidget(filter_group)
 
         # Actions
@@ -2224,6 +2910,11 @@ class MainWindow(QMainWindow):
         header.setStyleSheet("font-size: 13px; font-weight: bold; color: #E8E8E8; padding: 4px;")
         layout.addWidget(header)
 
+        self._summary_label = QLabel("Run a scan to compare with System Data.")
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setStyleSheet("font-size: 11px; color: #AAAAAA; padding: 0 4px 4px 4px;")
+        layout.addWidget(self._summary_label)
+
         self._model = ScanTableModel()
         self._proxy = NumericSortProxyModel()
         self._proxy.setSourceModel(self._model)
@@ -2242,8 +2933,16 @@ class MainWindow(QMainWindow):
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
         self._table.sortByColumn(COL_SIZE, Qt.DescendingOrder)
+        self._table.selectionModel().selectionChanged.connect(self._show_selected_folders)
 
         layout.addWidget(self._table)
+
+        folders_label = QLabel("Folders in the selected app")
+        folders_label.setStyleSheet("font-size: 11px; color: #888888; padding: 4px 0 0 0;")
+        layout.addWidget(folders_label)
+        self._folder_list = QListWidget()
+        self._folder_list.setMaximumHeight(140)
+        layout.addWidget(self._folder_list)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -2422,12 +3121,6 @@ class MainWindow(QMainWindow):
 
     def _on_item_found(self, item: dict):
         self._items.append(item)
-        # Check category filter before adding to table
-        cat = item["category"]
-        if self._cat_checkboxes.get(cat, QCheckBox()).isChecked():
-            min_bytes = self._size_slider.value() * 1024 * 1024
-            if item["size_bytes"] >= min_bytes:
-                self._model.add_item(item)
         self._update_title()
 
     def _on_scan_finished(self):
@@ -2438,14 +3131,24 @@ class MainWindow(QMainWindow):
         total = sum(i["size_bytes"] for i in self._items)
         wins = self._quick_wins_items()
         wins_total = sum(i["size_bytes"] for i in wins)
+        kept = self._worker.protected_kept if self._worker else []
+        kept_note = f" macOS is keeping {len(kept)} protected folders." if kept else ""
         self._status_label.setText(
-            f"Done — {len(self._items)} items | {format_size(total)} total "
-            f"| 🎯 {len(wins)} quick wins ({format_size(wins_total)} safe to free)"
+            f"Done — {len(self._items)} folders | {format_size(total)} total "
+            f"| 🎯 {len(wins)} quick wins ({format_size(wins_total)} safe to free)."
+            f"{kept_note}"
         )
+        report = self._worker.volume_report if self._worker else {}
+        summary = system_data_line(total, report)
+        if kept:
+            names = ", ".join(kept[:3])
+            more = f" and {len(kept) - 3} more" if len(kept) > 3 else ""
+            summary += f" macOS is keeping {len(kept)} protected folders ({names}{more})."
+        self._summary_label.setText(summary)
         self._wins_btn.setEnabled(bool(wins))
-        self._update_title()
-        self._charts.update_charts(self._visible_items())
         self._offender_log.record_scan(self._items)
+        self._apply_filters()
+        self._update_title()
         self._refresh_offenders_btn()
 
     def _quick_wins_items(self) -> list:
@@ -2455,6 +3158,8 @@ class MainWindow(QMainWindow):
             app_advice = CLEANUP_ADVICE.get(app_key)
             cat_advice = CATEGORY_ADVICE.get(item["category"], {})
             effective = app_advice if app_advice else cat_advice
+            if self._offender_log.is_ignored(item["app_name"]):
+                continue
             if effective.get("risk") == "safe" and item["size_bytes"] > 10 * 1024 * 1024:
                 safe.append(item)
         return sorted(safe, key=lambda x: x["size_bytes"], reverse=True)
@@ -2484,8 +3189,14 @@ class MainWindow(QMainWindow):
             self._offenders_btn.setText("🚨  Repeat Offenders")
 
     def _show_repeat_offenders(self):
-        dlg = RepeatOffendersDialog(self._offender_log, parent=self)
+        dlg = RepeatOffendersDialog(self._offender_log, scan_items=self._items, parent=self)
         dlg.exec()
+        if dlg.deleted_paths:
+            gone = set(dlg.deleted_paths)
+            self._items = [item for item in self._items if item["path"] not in gone]
+            self._apply_filters()
+            self._update_title()
+            self._charts.update_charts(self._visible_items())
 
     def _flag_as_offender(self, item: dict):
         self._offender_log.flag_app(item["app_name"])
@@ -2504,24 +3215,79 @@ class MainWindow(QMainWindow):
     # Filtering
     # ------------------------------------------------------------------
 
+    def _group_items(self, items: list) -> list:
+        buckets: dict[str, list] = {}
+        for item in items:
+            buckets.setdefault(item["app_name"], []).append(item)
+        groups = []
+        for name, folders in buckets.items():
+            folders = sorted(folders, key=lambda i: i["size_bytes"], reverse=True)
+            size = sum(i["size_bytes"] for i in folders)
+            cats = list(dict.fromkeys(i["category"] for i in folders))
+            prev = self._offender_log.previous_size(name)
+            grew = size - prev if prev is not None and size > prev * 1.05 else 0
+            groups.append({
+                "app_name": name,
+                "category": " · ".join(cats),
+                "size_bytes": size,
+                "last_modified": max(i["last_modified"] for i in folders),
+                "path": folders[0]["path"],
+                "folders": folders,
+                "grew_bytes": grew,
+                "ignored": self._offender_log.is_ignored(name),
+            })
+        return groups
+
     def _apply_filters(self):
         min_bytes = self._size_slider.value() * 1024 * 1024
         enabled_cats = {cat for cat, cb in self._cat_checkboxes.items() if cb.isChecked()}
+        query = self._search.text().strip().lower() if hasattr(self, "_search") else ""
+        hide_ignored = self._hide_ignored.isChecked() if hasattr(self, "_hide_ignored") else True
 
+        leaves = [i for i in self._items if i["category"] in enabled_cats]
         self._model.clear()
-        for item in self._items:
-            if item["category"] in enabled_cats and item["size_bytes"] >= min_bytes:
-                self._model.add_item(item)
+        for group in self._group_items(leaves):
+            if group["size_bytes"] < min_bytes:
+                continue
+            if hide_ignored and group["ignored"]:
+                continue
+            if query:
+                haystack = " ".join(
+                    [group["app_name"], group["category"]]
+                    + [f["path"] for f in group["folders"]]
+                ).lower()
+                if query not in haystack:
+                    continue
+            self._model.add_item(group)
 
-        self._charts.update_charts(self._visible_items())
+        self._charts.update_charts(self._visible_leaves())
+        self._show_selected_folders()
+
+    def _show_selected_folders(self):
+        if not hasattr(self, "_folder_list"):
+            return
+        self._folder_list.clear()
+        selected = self._selected_items() if self._table.selectionModel() else []
+        if len(selected) != 1:
+            return
+        for folder in selected[0].get("folders") or [selected[0]]:
+            self._folder_list.addItem(
+                f"{format_size(folder['size_bytes'])}   {folder['category']}   {folder['path']}"
+            )
+
+    def _visible_leaves(self) -> list:
+        leaves = []
+        for group in self._model.all_items():
+            leaves.extend(group.get("folders") or [group])
+        return leaves
 
     def _on_slider_changed(self, val: int):
         self._size_label.setText(f"Min Size: {val} MB")
         self._apply_filters()
 
     def _visible_items(self) -> list:
-        """Return items currently shown in the table (post-filter)."""
-        return self._model.all_items()
+        """Leaf folders currently shown, so charts are not grouped twice."""
+        return self._visible_leaves()
 
     # ------------------------------------------------------------------
     # Context menu
@@ -2534,8 +3300,9 @@ class MainWindow(QMainWindow):
         for proxy_index in self._table.selectionModel().selectedRows():
             src = self._proxy.mapToSource(proxy_index)
             item = self._model.all_items()[src.row()]
-            if item["path"] not in seen:
-                seen.add(item["path"])
+            key = item["app_name"]
+            if key not in seen:
+                seen.add(key)
                 items.append(item)
         return items
 
@@ -2548,7 +3315,7 @@ class MainWindow(QMainWindow):
         # If the right-clicked row isn't already in the selection, treat it as single
         src = self._proxy.mapToSource(index)
         clicked_item = self._model.all_items()[src.row()]
-        if clicked_item["path"] not in {i["path"] for i in selected}:
+        if clicked_item["app_name"] not in {i["app_name"] for i in selected}:
             selected = [clicked_item]
 
         menu = QMenu(self)
@@ -2566,11 +3333,27 @@ class MainWindow(QMainWindow):
             trash_action = QAction("🗑  Move to Trash", self)
             trash_action.triggered.connect(lambda: self._confirm_trash(item))
             menu.addAction(trash_action)
+            installed, app_path = _is_app_installed(item["app_name"])
+            if installed and app_path:
+                menu.addSeparator()
+                find_app = QAction("📂  Find App", self)
+                find_app.triggered.connect(lambda: _reveal_path(app_path))
+                menu.addAction(find_app)
+                remove_app = QAction("🗑  Remove App", self)
+                remove_app.triggered.connect(lambda: self._remove_installed_app(item["app_name"], app_path))
+                menu.addAction(remove_app)
             menu.addSeparator()
             flag_action = QAction("🚩  Flag as Offender", self)
             flag_action.setToolTip("Add to Repeat Offenders watch list without deleting")
             flag_action.triggered.connect(lambda: self._flag_as_offender(item))
             menu.addAction(flag_action)
+            if item.get("ignored"):
+                aside = QAction("↩  Show this again", self)
+                aside.triggered.connect(lambda: self._set_aside(item, False))
+            else:
+                aside = QAction("🚫  Leave this alone", self)
+                aside.triggered.connect(lambda: self._set_aside(item, True))
+            menu.addAction(aside)
         else:
             total_size = sum(i["size_bytes"] for i in selected)
             header = QAction(f"{n} items selected  ({format_size(total_size)})", self)
@@ -2594,27 +3377,39 @@ class MainWindow(QMainWindow):
     def _show_cleanup_advice(self, item: dict):
         dlg = CleanupAdviceDialog(item, parent=self)
         dlg.exec()
-        if dlg.deleted:
-            self._remove_item(item["path"])
+        if dlg.deleted_paths:
+            gone = set(dlg.deleted_paths)
+            self._items = [i for i in self._items if i["path"] not in gone]
+            self._apply_filters()
+            self._update_title()
+
+    def _set_aside(self, item: dict, ignored: bool):
+        self._offender_log.set_ignored(item["app_name"], ignored)
+        self._apply_filters()
 
     def _confirm_trash(self, item: dict):
-        path = item["path"]
+        folders = item.get("folders") or [item]
+        label = item["app_name"]
+        if len(folders) > 1:
+            label += f" ({len(folders)} folders)"
         reply = QMessageBox.question(
             self, "Move to Trash",
-            f"Move to Trash?\n\n{Path(path).name}\n({format_size(item['size_bytes'])})",
+            f"Move to Trash?\n\n{label}\n({format_size(item['size_bytes'])})",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
-        if reply == QMessageBox.Yes:
-            if _move_to_trash_mac(path):
-                self._remove_item(path)
+        if reply != QMessageBox.Yes:
+            return
+        failed = []
+        for folder in folders:
+            ok, detail = _move_to_trash_mac(folder["path"])
+            if ok:
+                self._items = [i for i in self._items if i["path"] != folder["path"]]
             else:
-                QMessageBox.critical(
-                    self, "Error",
-                    "Could not move to Trash.\n\n"
-                    "Try 'Reveal in Finder' and deleting manually.\n\n"
-                    "Note: macOS-protected folders (e.g. Containers) must be\n"
-                    "deleted via Finder, not Terminal.",
-                )
+                failed.append(detail or Path(folder["path"]).name)
+        self._apply_filters()
+        self._update_title()
+        if failed:
+            QMessageBox.critical(self, "Error", "\n".join(failed))
 
     def _confirm_trash_multiple(self, items: list):
         total_size = sum(i["size_bytes"] for i in items)
@@ -2630,11 +3425,17 @@ class MainWindow(QMainWindow):
             return
 
         failed = []
+        notes = []
         for item in items:
-            if _move_to_trash_mac(item["path"]):
-                self._items = [i for i in self._items if i["path"] != item["path"]]
-            else:
-                failed.append(Path(item["path"]).name)
+            for folder in item.get("folders") or [item]:
+                ok, detail = _move_to_trash_mac(folder["path"])
+                if ok:
+                    self._items = [i for i in self._items if i["path"] != folder["path"]]
+                    if detail:
+                        notes.append(detail)
+                else:
+                    name = Path(folder["path"]).name
+                    failed.append(f"{name}: {detail}" if detail else name)
 
         self._apply_filters()
         self._update_title()
@@ -2643,10 +3444,10 @@ class MainWindow(QMainWindow):
         if failed:
             QMessageBox.warning(
                 self, "Some Items Failed",
-                "Could not move to Trash:\n• " + "\n• ".join(failed) +
-                "\n\nTry 'Reveal in Finder' for these and delete manually.\n"
-                "Note: macOS-protected folders must be deleted via Finder.",
+                "Could not move to Trash:\n• " + "\n• ".join(failed),
             )
+        elif notes:
+            QMessageBox.information(self, "Moved to Trash", "\n\n".join(notes))
 
     def _remove_item(self, path: str):
         self._items = [i for i in self._items if i["path"] != path]
@@ -2655,10 +3456,20 @@ class MainWindow(QMainWindow):
         self._charts.update_charts(self._visible_items())
 
     def _reveal_in_finder(self, path: str):
-        try:
-            subprocess.run(["open", "-R", path], check=False)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not open Finder:\n{e}")
+        _reveal_path(path)
+
+    def _remove_installed_app(self, app_name: str, app_path: str):
+        if not _confirm_remove_app(self, app_name, app_path):
+            return
+        ok, detail = _move_to_trash_mac(app_path)
+        if ok:
+            QMessageBox.information(
+                self, "App Moved to Trash",
+                detail or f"{Path(app_path).name} is in the Trash.\n\n"
+                "Its leftover data is still listed here until you remove those folders too.",
+            )
+        else:
+            QMessageBox.critical(self, "Error", detail or "Could not move the app to Trash.")
 
     # ------------------------------------------------------------------
     # Export
