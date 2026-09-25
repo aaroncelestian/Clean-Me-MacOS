@@ -1296,14 +1296,14 @@ def _finder_delete(paths: list[str]) -> tuple[bool, str]:
         return True, ""
     for start in range(0, len(paths), 40):
         chunk = paths[start:start + 40]
-        lines = ['tell application "Finder"', "delete {"]
-        for p in chunk:
-            escaped = p.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'POSIX file "{escaped}",')
-        lines.extend(["}", "end tell"])
+        files = ", ".join(
+            'POSIX file "' + p.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            for p in chunk
+        )
+        script = f'tell application "Finder" to delete {{{files}}}'
         try:
             result = subprocess.run(
-                ["osascript", "-e", "\n".join(lines)],
+                ["osascript", "-e", script],
                 capture_output=True, text=True, timeout=120,
             )
         except Exception as exc:
